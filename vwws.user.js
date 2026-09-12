@@ -49,7 +49,7 @@
     // ================================================================
 
     // 🦴 全局监听状态：默认开启
-    var boneListening = true;
+    var boneListening = false;
 
 
     function clickNext() {
@@ -314,7 +314,7 @@
         var multiBtn     = mk('my-btn-multi',      '🙍',    52, 235, 45, RED,    12);
         var invalidBtn   = mk('my-btn-invalid',    '无效',   52, 290, 45, RED,    12);
         var selectAllBtn = mk('my-btn-selectall',  '全选',   52, 345, 45, RED,    12);
-        var boneBtn      = mk('my-btn-bone',       '🦴',    -20, 102, 45, BLUE,   18);
+        var boneBtn      = mk('my-btn-bone',       '🦴',    -20, 102, 45, YELLOW,   18);
 
 
         // ---------- 文字 + 颜色跟随 select 值 ----------
