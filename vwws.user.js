@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         V我50😋
 // @namespace    http://tampermonkey.net/
-// @version      5.1
+// @version      5.2
 // @description  快捷键或悬浮按钮触发；🦴 全局监听粘贴并清洗文本（默认开启）
 // @author       Roki
 // @match        http://10.38.178.17/*
