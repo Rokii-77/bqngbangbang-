@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         啪嗒💧
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  左键单击复制竖线后 / 拖选复制选中 / 右键复制全部
 // @author       Roki
 // @match        http://10.38.178.17/*
+// @grant        GM_setClipboard
 // @updateURL    https://cdn.jsdelivr.net/gh/Rokii-77/bqngbangbang-@main/pd.user.js
 // @downloadURL  https://cdn.jsdelivr.net/gh/Rokii-77/bqngbangbang-@main/pd.user.js
 // ==/UserScript==
