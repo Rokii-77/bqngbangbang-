@@ -3,6 +3,11 @@
 // @namespace    local.vsm
 // @version      5.7.0
 // @description  动态识别人物并快捷选择（快捷键=人物编号/右键脱离/双击拖回）+ 标注状态常驻助手，两个横向面板，均可拖动、记忆位置、识别不到自动隐藏
+// @author       Roki
+// @homepageURL  https://github.com/Rokii-77/bqngbangbang-
+// @supportURL   https://github.com/Rokii-77/bqngbangbang-/issues
+// @updateURL    https://raw.githubusercontent.com/Rokii-77/bqngbangbang-/refs/heads/main/fangx
+// @downloadURL  https://raw.githubusercontent.com/Rokii-77/bqngbangbang-/refs/heads/main/fangx
 // @include      /^https?:\/\/221\.2\.217\.94(:\d+)?\//
 // @run-at       document-idle
 // @grant        none
