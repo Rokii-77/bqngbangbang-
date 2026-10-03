@@ -1,0 +1,1215 @@
+// ==UserScript==
+// @name         🚥
+// @namespace    local.vsm
+// @version      5.7.0
+// @description  动态识别人物并快捷选择（快捷键=人物编号/右键脱离/双击拖回）+ 标注状态常驻助手，两个横向面板，均可拖动、记忆位置、识别不到自动隐藏
+// @include      /^https?:\/\/221\.2\.217\.94(:\d+)?\//
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  if (window.__vsmFusionLoaded) return;
+  window.__vsmFusionLoaded = true;
+
+  /* ============================================================
+   *  一、公共配置
+   * ============================================================ */
+
+  const MAIN_GROUPS = [
+    { key: 'head', short: '头', title: '头部姿势', map: { '左转': '👉转', '右转': '👈转', '正视': '正视', '低头': '低头', '抬头': '抬头', '难以判断': '❌' } },
+    { key: 'gaze', short: '视线', title: '视线方向', map: { '前视': '前看', '左视': '👉看', '右视': '👈看', '其他': '❌' } },
+    { key: 'eye', short: '眼', title: '疲劳程度-眼部状态', map: { '正常睁眼': '睁眼', '半闭': '半睁', '闭眼': '闭眼', '难以判断': '❌' } },
+    { key: 'mouth', short: '嘴', title: '疲劳程度-嘴部状态', map: { '闭合': '闭嘴', '微微张开': '微张', '大张': '张嘴', '难以判断': '❌' } },
+    { key: 'emotion', short: '情绪', title: '情绪', map: { '平静': '平静', '高兴': '高兴', '悲伤': '难过', '愤怒': '生气', '恐惧': '害怕', '厌恶': '讨厌', '惊讶': '惊讶', '难以判断': '❌' } }
+  ];
+
+  const OTHER_GROUPS = [
+    { title: '驾驶员手部姿态', short: '方向盘' },
+    { title: '日常乘坐行为', short: '行为' },
+    { title: '抽烟与明火', short: '抽烟' },
+    { title: '手势类别', short: '手势' },
+    { title: '是否相似物负样本', short: '负样本' },
+    { title: '驾驶区域入侵', short: '入侵' }
+  ];
+
+  const ITEM_HINTS = ['饮料瓶', '纸巾盒', '笔记本电脑', '儿童安全座椅', '婴儿座椅', '毛绒玩具'];
+
+  const POS_KEY_MAIN = 'vsm_fusion_main_pos_v3';
+  const POS_KEY_QUICK = 'vsm_fusion_quick_pos_v3';
+  const POS_KEY_QUICK_ITEM = 'vsm_fusion_quick_item_v3_';
+
+  const SEL_ROW = '.lsf-ann-side-panel__region-tree-row';
+  const SEL_LABEL = '.lsf-ann-side-panel__region-tree-label';
+  const SEL_ITEM_BTN = '.lsf-ann-side-panel__region-tree-item';
+  const ACTIVE_ROW = 'lsf-ann-side-panel__region-tree-row_active';
+  const ACTIVE_ITEM = 'lsf-ann-side-panel__region-tree-item_active';
+
+  const MAX_HOTKEY = 6;
+
+  /* ============================================================
+   *  二、通用工具函数
+   * ============================================================ */
+
+  function isVisible(el) {
+    if (!el) return false;
+    const s = window.getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  }
+  function flipLR(t) { return String(t).replace(/左侧/g, '👉').replace(/右侧/g, '👈').replace(/左/g, '👉').replace(/右/g, '👈'); }
+  function prettyText(raw, map) { return (map && map[raw] != null) ? map[raw] : flipLR(raw); }
+  function isNoneLike(v) { return /^无$/.test(String(v).trim()); }
+  function isXLike(v) { return /^(难以判断|无法判断|无法判定|未知|unkown|unknown|其他)$/i.test(String(v).trim()); }
+
+  function getPersonNumber(personName) {
+    const m = String(personName).match(/\d+/);
+    if (!m) return null;
+    const n = parseInt(m[0], 10);
+    if (isNaN(n)) return null;
+    return n;
+  }
+
+  function findGroupEl(title) {
+    const ts = document.querySelectorAll('.lsf-ann-side-panel__section-title_attribute');
+    for (let i = 0; i < ts.length; i++) if (ts[i].textContent.trim() === title) return ts[i].closest('.lsf-ann-side-panel__region-attribute-group');
+    return null;
+  }
+  function findItemGroup() {
+    const cs = document.querySelectorAll('.lsf-ann-side-panel__rendered-control_region');
+    for (let i = 0; i < cs.length; i++) {
+      const inputs = cs[i].querySelectorAll('input.ant-checkbox-input');
+      if (!inputs.length) continue;
+      let hit = 0;
+      for (let j = 0; j < inputs.length; j++) if (ITEM_HINTS.indexOf(inputs[j].name) >= 0) hit++;
+      if (hit >= 2) return cs[i];
+    }
+    return null;
+  }
+  function labelTextOf(input) {
+    const l = input.closest('label');
+    if (!l) return input.name || '';
+    const s = Array.prototype.filter.call(l.children, function (el) { return el.tagName === 'SPAN'; });
+    const last = s[s.length - 1];
+    return last ? last.textContent.trim() : (input.name || '');
+  }
+  function isChecked(input) {
+    if (input.checked) return true;
+    const l = input.closest('label');
+    return !!(l && l.classList.contains('ant-checkbox-wrapper-checked'));
+  }
+  function readGroup(title) {
+    const g = findGroupEl(title);
+    if (!g) return null;
+    const inputs = Array.prototype.slice.call(g.querySelectorAll('input.ant-checkbox-input'));
+    return { group: g, inputs: inputs, checked: inputs.filter(isChecked) };
+  }
+  function clickOption(title, rawText) {
+    const st = readGroup(title);
+    if (!st) return;
+    let target = null;
+    for (let i = 0; i < st.inputs.length; i++) if (labelTextOf(st.inputs[i]) === rawText) { target = st.inputs[i]; break; }
+    if (!target) return;
+    if (isChecked(target)) { try { target.click(); } catch (e) {} return; }
+    try { target.click(); } catch (e) {}
+    setTimeout(function () {
+      st.inputs.forEach(function (inp) {
+        if (inp !== target && isChecked(inp)) { try { inp.click(); } catch (e) {} }
+      });
+    }, 60);
+  }
+  function triggerOverrideNextFrames() {
+    const bs = document.querySelectorAll('.lsf-ann-side-panel__attr-override-button');
+    for (let i = 0; i < bs.length; i++) if (bs[i].textContent.trim() === '后续帧') { try { bs[i].click(); return true; } catch (e) { return false; } }
+    return false;
+  }
+
+  // 只从“全部目标”列表里读取人物（切帧时这个列表会同步更新）
+  function getPersonNames() {
+    const rows = document.querySelectorAll(SEL_ROW);
+    const names = [];
+    rows.forEach(function (row) {
+      const panel = row.closest('.lsf-ann-side-panel__region-tree-list');
+      if (!panel) return;
+      const label = row.querySelector(SEL_LABEL);
+      if (label) {
+        const t = label.textContent.trim();
+        if (t && names.indexOf(t) < 0) names.push(t);
+      }
+    });
+    return names;
+  }
+
+  /* ============================================================
+   *  三、位置记忆
+   * ============================================================ */
+
+  function savePosition(k, l, t) { try { localStorage.setItem(k, JSON.stringify({ left: l, top: t })); } catch (e) {} }
+  function loadPosition(k) {
+    try {
+      const r = localStorage.getItem(k);
+      if (!r) return null;
+      const p = JSON.parse(r);
+      if (p && typeof p.left === 'number' && typeof p.top === 'number') return p;
+    } catch (e) {}
+    return null;
+  }
+  function applyPosition(el, pos, defRight, defBottom) {
+    if (pos) {
+      const w = el.offsetWidth, h = el.offsetHeight;
+      const nx = Math.max(0, Math.min(pos.left, window.innerWidth - w));
+      const ny = Math.max(0, Math.min(pos.top, window.innerHeight - h));
+      el.style.left = nx + 'px';
+      el.style.top = ny + 'px';
+      el.style.right = 'auto';
+      el.style.bottom = 'auto';
+    } else {
+      el.style.left = 'auto';
+      el.style.top = 'auto';
+      if (defRight != null) el.style.right = defRight + 'px';
+      if (defBottom != null) el.style.bottom = defBottom + 'px';
+    }
+  }
+
+  /* ============================================================
+   *  四、拖拽逻辑
+   * ============================================================ */
+
+  function makeDraggable(el, options) {
+    options = options || {};
+    const saveKey = options.saveKey || null;
+    const onDragStart = options.onDragStart || null;
+    const onDragEnd = options.onDragEnd || null;
+    const dragHandleSelector = options.dragHandleSelector || null;
+
+    let dragging = false, moved = false, startPt = null, startRect = null;
+
+    el.addEventListener('mousedown', function (e) {
+      if (e.button !== 0) return;
+      if (dragHandleSelector && !(e.target.closest && e.target.closest(dragHandleSelector))) return;
+      if (e.target.closest && (e.target.closest('.vsm-dropdown') || e.target.closest('.vsm-tag') || e.target.closest('.vsm-chip') || e.target.closest('button'))) return;
+      dragging = true;
+      moved = false;
+      startPt = { x: e.clientX, y: e.clientY };
+      const r = el.getBoundingClientRect();
+      startRect = { left: r.left, top: r.top };
+      e.preventDefault();
+      if (onDragStart) onDragStart();
+    });
+
+    document.addEventListener('mousemove', function (e) {
+      if (!dragging) return;
+      const dx = e.clientX - startPt.x, dy = e.clientY - startPt.y;
+      if (!moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+      moved = true;
+      const w = el.offsetWidth, h = el.offsetHeight;
+      const nx = Math.max(0, Math.min(startRect.left + dx, window.innerWidth - w));
+      const ny = Math.max(0, Math.min(startRect.top + dy, window.innerHeight - h));
+      el.style.left = nx + 'px';
+      el.style.top = ny + 'px';
+      el.style.right = 'auto';
+      el.style.bottom = 'auto';
+    });
+
+    document.addEventListener('mouseup', function () {
+      if (!dragging) return;
+      dragging = false;
+      if (moved) {
+        if (saveKey && el.style.left && el.style.left !== 'auto') {
+          savePosition(saveKey, parseFloat(el.style.left), parseFloat(el.style.top));
+        }
+        if (onDragEnd) onDragEnd();
+      }
+      setTimeout(function () { moved = false; }, 0);
+    });
+
+    return {
+      isMoved: function () { return moved; },
+      resetMoved: function () { moved = false; }
+    };
+  }
+
+  /* ============================================================
+   *  五、下拉菜单（共享）
+   * ============================================================ */
+
+  let currentDropdown = null, currentAnchorEl = null;
+
+  function closeDropdown() {
+    if (currentDropdown) {
+      currentDropdown.remove();
+      currentDropdown = null;
+      currentAnchorEl = null;
+    }
+  }
+  function showDropdown(anchorEl, items, opts) {
+    opts = opts || {};
+    const multi = !!opts.multi;
+    closeDropdown();
+    currentAnchorEl = anchorEl;
+
+    const dd = document.createElement('div');
+    dd.className = 'vsm-dropdown';
+    dd.style.position = 'fixed';
+
+    function renderOptions() {
+      dd.innerHTML = '';
+      items.forEach(function (item) {
+        const opt = document.createElement('div');
+        opt.className = 'vsm-opt' + (item.isChecked() ? ' vsm-cur' : '');
+        opt.textContent = item.text;
+        opt.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+        opt.addEventListener('click', function (e) {
+          e.stopPropagation();
+          item.select();
+          if (multi) {
+            setTimeout(function () { renderOptions(); }, 80);
+            setTimeout(function () { renderOptions(); }, 220);
+          } else {
+            closeDropdown();
+            setTimeout(function () { renderAll(); }, 80);
+            setTimeout(function () { renderAll(); }, 220);
+          }
+        });
+        dd.appendChild(opt);
+      });
+    }
+    renderOptions();
+
+    dd.style.visibility = 'hidden';
+    document.body.appendChild(dd);
+
+    const dr = dd.getBoundingClientRect();
+    const ar = anchorEl.getBoundingClientRect();
+    let top = ar.bottom + 6;
+    let left = ar.left;
+    if (top + dr.height > window.innerHeight - 8) top = Math.max(8, ar.top - dr.height - 6);
+    if (left + dr.width > window.innerWidth - 8) left = window.innerWidth - dr.width - 8;
+    if (left < 8) left = 8;
+    if (top < 8) top = 8;
+
+    dd.style.top = top + 'px';
+    dd.style.left = left + 'px';
+    dd.style.minWidth = Math.max(dr.width, ar.width) + 'px';
+    dd.style.visibility = '';
+    currentDropdown = dd;
+  }
+
+  document.addEventListener('mousedown', function (e) {
+    if (!currentDropdown) return;
+    if (currentDropdown.contains(e.target)) return;
+    if (e.target.closest && e.target.closest('.vsm-chip, .vsm-tag, .vsm-check, .vsm-quick-btn')) return;
+    closeDropdown();
+  }, true);
+  window.addEventListener('scroll', function () { if (currentDropdown) closeDropdown(); }, true);
+
+  /* ============================================================
+   *  六、样式
+   * ============================================================ */
+
+  const CSS = `
+.vsm-panel {
+  position: fixed;
+  z-index: 2147483646;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: rgba(24,26,32,.32);
+  color: #f0f0f2;
+  border-radius: 16px;
+  font: 16px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  box-shadow: 0 8px 28px rgba(0,0,0,.25);
+  user-select: none;
+  -webkit-user-select: none;
+  white-space: nowrap;
+  box-sizing: border-box;
+  backdrop-filter: blur(5px);
+  transition: background .18s, box-shadow .18s, opacity .18s;
+  opacity: .55;
+}
+.vsm-panel:hover {
+  background: rgba(24,26,32,.92);
+  box-shadow: 0 10px 34px rgba(0,0,0,.55);
+  opacity: 1;
+}
+.vsm-panel * { box-sizing: border-box; }
+
+/* 状态助手面板（头部姿势面板）更实一些，看得清 */
+#vsm-main-panel {
+  opacity: .9;
+  background: rgba(24,26,32,.7);
+}
+#vsm-main-panel:hover {
+  opacity: 1;
+  background: rgba(24,26,32,.95);
+}
+
+.vsm-drag-handle {
+  cursor: grab;
+  padding: 0 4px;
+  color: #8a8a92;
+  font-size: 18px;
+  line-height: 1;
+  user-select: none;
+}
+.vsm-drag-handle:active { cursor: grabbing; }
+
+.vsm-chip {
+  position: relative;
+  display: inline-block;
+  padding: 6px 14px;
+  border-radius: 10px;
+  background: rgba(255,255,255,.14);
+  cursor: pointer;
+  transition: background .12s;
+  font-size: 16px;
+}
+.vsm-chip:hover { background: rgba(255,255,255,.28); }
+.vsm-chip.vsm-none { color: #8a8a92; }
+.vsm-chip.vsm-item { background: rgba(120,170,255,.22); }
+.vsm-chip.vsm-item:hover { background: rgba(120,170,255,.38); }
+
+.vsm-check {
+  display: inline-block;
+  padding: 6px 14px;
+  border-radius: 10px;
+  background: rgba(90,190,130,.28);
+  color: #7ee2a8;
+  cursor: pointer;
+  transition: background .12s;
+  font-size: 16px;
+  min-width: 44px;
+  text-align: center;
+}
+.vsm-check:hover { background: rgba(90,190,130,.5); }
+.vsm-check.vsm-active { background: rgba(90,190,130,.75); color: #fff; }
+.vsm-check.vsm-check-red { background: rgba(220,60,60,.3); color: #ff8080; }
+.vsm-check.vsm-check-red:hover { background: rgba(220,60,60,.5); }
+.vsm-check.vsm-check-red.vsm-active { background: rgba(220,60,60,.8); color: #fff; }
+
+/* 快捷选择按钮（无角标） */
+.vsm-quick-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  height: 42px;
+  padding: 0 8px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: rgba(255,255,255,.12);
+  color: #e6e6ea;
+  font-weight: 600;
+  font-size: 15px;
+  cursor: pointer;
+  transition: all .15s;
+  font-family: inherit;
+  position: relative;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.vsm-quick-btn:hover { background: rgba(255,255,255,.26); }
+.vsm-quick-btn:active { transform: scale(.95); }
+.vsm-quick-btn.active {
+  background: rgba(103,194,58,.35);
+  border-color: #67c23a;
+  color: #fff;
+  box-shadow: 0 0 0 2px rgba(103,194,58,.3);
+}
+.vsm-quick-btn.active::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  background: #67c23a;
+  border-radius: 50%;
+  border: 1.5px solid rgba(24,26,32,.9);
+}
+
+.vsm-quick-btn.vsm-quick-btn-detached {
+  position: fixed;
+  z-index: 2147483646;
+  min-width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  background: rgba(24,26,32,.42);
+  box-shadow: 0 6px 20px rgba(0,0,0,.35);
+  backdrop-filter: blur(5px);
+  border: 1px solid rgba(255,255,255,.08);
+  opacity: .6;
+  transition: opacity .18s, background .18s;
+}
+.vsm-quick-btn.vsm-quick-btn-detached:hover {
+  background: rgba(24,26,32,.92);
+  opacity: 1;
+}
+.vsm-quick-btn.vsm-quick-btn-detached.active {
+  background: rgba(103,194,58,.5);
+  opacity: 1;
+}
+
+.vsm-dropdown {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px;
+  background: #23262e;
+  border-radius: 12px;
+  box-shadow: 0 12px 34px rgba(0,0,0,.6);
+  z-index: 2147483647;
+  color: #f0f0f2;
+  font: 16px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  box-sizing: border-box;
+}
+.vsm-dropdown .vsm-opt {
+  padding: 8px 18px;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .1s;
+  font-size: 16px;
+}
+.vsm-dropdown .vsm-opt:hover { background: rgba(255,255,255,.18); }
+.vsm-dropdown .vsm-opt.vsm-cur { background: #3b82f6; color: #fff; }
+
+.vsm-more {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 12px);
+  width: 440px;
+  max-height: 60vh;
+  overflow-y: auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 14px;
+  background: #23262e;
+  border-radius: 16px;
+  box-shadow: 0 12px 34px rgba(0,0,0,.6);
+  white-space: normal;
+}
+.vsm-tag {
+  padding: 6px 14px;
+  border-radius: 9px;
+  background: rgba(255,255,255,.14);
+  font-size: 15px;
+  color: #e6e6ea;
+  cursor: pointer;
+  transition: background .12s;
+}
+.vsm-tag:hover { background: rgba(255,255,255,.28); }
+.vsm-tag.vsm-none { color: #6f6f78; background: rgba(255,255,255,.06); }
+.vsm-tag.vsm-none:hover { background: rgba(255,255,255,.12); }
+.vsm-tag.vsm-action { background: rgba(255,160,60,.22); color: #ffbe76; font-weight: 600; margin-left: auto; }
+.vsm-tag.vsm-action:hover { background: rgba(255,160,60,.42); }
+.vsm-tag.vsm-action.vsm-done { background: rgba(90,190,130,.5); color: #fff; }
+.vsm-more::-webkit-scrollbar { width: 8px; }
+.vsm-more::-webkit-scrollbar-thumb { background: rgba(255,255,255,.25); border-radius: 4px; }
+`;
+
+  function injectStyle() {
+    if (document.getElementById('vsm-fusion-style')) return;
+    const s = document.createElement('style');
+    s.id = 'vsm-fusion-style';
+    s.textContent = CSS;
+    (document.head || document.documentElement).appendChild(s);
+  }
+
+  /* ============================================================
+   *  七、快捷选择面板
+   * ============================================================ */
+
+  let quickPanelEl = null;
+  let quickButtons = {};      // person -> button
+  const quickDragStates = {}; // person -> drag state
+  let orderedPersons = [];
+
+  let rebuildLock = false;
+
+  function findRowByPerson(personName) {
+    const rows = document.querySelectorAll(SEL_ROW);
+    for (let i = 0; i < rows.length; i++) {
+      const label = rows[i].querySelector(SEL_LABEL);
+      if (label && label.textContent.trim() === personName) {
+        const panel = rows[i].closest('.lsf-ann-side-panel__region-tree-list');
+        if (panel) return rows[i];
+      }
+    }
+    return null;
+  }
+
+  function activatePerson(personName) {
+    const targetRow = findRowByPerson(personName);
+    if (!targetRow) return;
+
+    const rows = document.querySelectorAll(SEL_ROW);
+    rows.forEach(function (row) {
+      row.classList.remove(ACTIVE_ROW);
+      const itemBtn = row.querySelector(SEL_ITEM_BTN);
+      if (itemBtn) {
+        itemBtn.classList.remove(ACTIVE_ITEM);
+        itemBtn.setAttribute('aria-pressed', 'false');
+      }
+    });
+
+    targetRow.classList.add(ACTIVE_ROW);
+    const targetItem = targetRow.querySelector(SEL_ITEM_BTN);
+    if (targetItem) {
+      targetItem.classList.add(ACTIVE_ITEM);
+      targetItem.setAttribute('aria-pressed', 'true');
+      try { targetItem.click(); } catch (e) {}
+    }
+    updateQuickActiveState(personName);
+  }
+
+  function updateQuickActiveState(activePerson) {
+    Object.keys(quickButtons).forEach(function (person) {
+      const btn = quickButtons[person];
+      if (!btn) return;
+      if (person === activePerson) btn.classList.add('active');
+      else btn.classList.remove('active');
+    });
+  }
+
+  function initQuickActiveState() {
+    const activeRow = document.querySelector('.' + ACTIVE_ROW);
+    if (activeRow) {
+      const label = activeRow.querySelector(SEL_LABEL);
+      if (label) updateQuickActiveState(label.textContent.trim());
+    } else {
+      updateQuickActiveState(null);
+    }
+  }
+
+  function detachQuickButton(person) {
+    const btn = quickButtons[person];
+    if (!btn || btn.classList.contains('vsm-quick-btn-detached')) return;
+    const rect = btn.getBoundingClientRect();
+    if (btn.parentNode) btn.parentNode.removeChild(btn);
+    btn.classList.add('vsm-quick-btn-detached');
+    document.body.appendChild(btn);
+    btn.style.left = rect.left + 'px';
+    btn.style.top = rect.top + 'px';
+    btn.style.right = 'auto';
+    btn.style.bottom = 'auto';
+    savePosition(POS_KEY_QUICK_ITEM + person, rect.left, rect.top);
+    bindDetachedButtonDrag(btn, person);
+  }
+
+  function attachQuickButton(person) {
+    const btn = quickButtons[person];
+    if (!btn || !btn.classList.contains('vsm-quick-btn-detached')) return;
+    if (quickDragStates[person]) {
+      const ds = quickDragStates[person];
+      if (ds.cleanup) ds.cleanup();
+      delete quickDragStates[person];
+    }
+    btn.classList.remove('vsm-quick-btn-detached');
+    btn.style.left = '';
+    btn.style.top = '';
+    btn.style.right = '';
+    btn.style.bottom = '';
+
+    const existing = Array.prototype.filter.call(
+      quickPanelEl.querySelectorAll('.vsm-quick-btn'),
+      function (b) { return b.parentNode === quickPanelEl; }
+    );
+    const personIndex = orderedPersons.indexOf(person);
+    let inserted = false;
+    for (let i = 0; i < existing.length; i++) {
+      const otherPerson = existing[i].dataset.person;
+      const otherIndex = orderedPersons.indexOf(otherPerson);
+      if (otherIndex > personIndex) {
+        quickPanelEl.insertBefore(btn, existing[i]);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) {
+      if (existing.length > 0) {
+        const last = existing[existing.length - 1];
+        if (last.nextSibling) quickPanelEl.insertBefore(btn, last.nextSibling);
+        else quickPanelEl.appendChild(btn);
+      } else {
+        const handle = quickPanelEl.querySelector('.vsm-drag-handle');
+        if (handle && handle.nextSibling) quickPanelEl.insertBefore(btn, handle.nextSibling);
+        else quickPanelEl.appendChild(btn);
+      }
+    }
+    try { localStorage.removeItem(POS_KEY_QUICK_ITEM + person); } catch (e) {}
+    initQuickActiveState();
+  }
+
+  function bindDetachedButtonDrag(btn, person) {
+    if (quickDragStates[person]) {
+      const old = quickDragStates[person];
+      if (old.cleanup) old.cleanup();
+    }
+    let dragging = false, moved = false, startPt = null, startRect = null;
+    let cleanupFns = [];
+
+    function onMouseDown(e) {
+      if (e.button !== 0) return;
+      dragging = true;
+      moved = false;
+      startPt = { x: e.clientX, y: e.clientY };
+      const r = btn.getBoundingClientRect();
+      startRect = { left: r.left, top: r.top };
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    function onMouseMove(e) {
+      if (!dragging) return;
+      const dx = e.clientX - startPt.x, dy = e.clientY - startPt.y;
+      if (!moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+      moved = true;
+      const w = btn.offsetWidth, h = btn.offsetHeight;
+      const nx = Math.max(0, Math.min(startRect.left + dx, window.innerWidth - w));
+      const ny = Math.max(0, Math.min(startRect.top + dy, window.innerHeight - h));
+      btn.style.left = nx + 'px';
+      btn.style.top = ny + 'px';
+      btn.style.right = 'auto';
+      btn.style.bottom = 'auto';
+    }
+    function onMouseUp(e) {
+      if (!dragging) return;
+      dragging = false;
+      if (moved) {
+        savePosition(POS_KEY_QUICK_ITEM + person, parseFloat(btn.style.left), parseFloat(btn.style.top));
+      }
+      setTimeout(function () { moved = false; }, 0);
+    }
+    function onDblClick(e) {
+      if (moved) return;
+      e.stopPropagation();
+      attachQuickButton(person);
+    }
+    function onContextMenu(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      attachQuickButton(person);
+    }
+
+    btn.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    btn.addEventListener('dblclick', onDblClick);
+    btn.addEventListener('contextmenu', onContextMenu);
+
+    cleanupFns.push(function () {
+      btn.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      btn.removeEventListener('dblclick', onDblClick);
+      btn.removeEventListener('contextmenu', onContextMenu);
+    });
+
+    quickDragStates[person] = {
+      cleanup: function () { cleanupFns.forEach(function (fn) { fn(); }); }
+    };
+  }
+
+  // 按钮内容：数字 = 人物编号，无角标
+  function updateButtonContent(btn, person) {
+    const num = getPersonNumber(person);
+    const mainText = num != null ? String(num) : person;
+    let mainSpan = btn.querySelector('.vsm-btn-main');
+    if (!mainSpan) {
+      btn.innerHTML = '';
+      mainSpan = document.createElement('span');
+      mainSpan.className = 'vsm-btn-main';
+      btn.appendChild(mainSpan);
+    }
+    if (mainSpan.textContent !== mainText) mainSpan.textContent = mainText;
+
+    // 去掉可能残留的角标
+    const hotkeyEl = btn.querySelector('.vsm-hotkey');
+    if (hotkeyEl && hotkeyEl.parentNode) hotkeyEl.parentNode.removeChild(hotkeyEl);
+
+    const titleText = '左键选择 ' + person + (num != null ? '（快捷键 ' + num + '）' : '') + '，右键拖出';
+    if (btn.title !== titleText) btn.title = titleText;
+  }
+
+  function createQuickButton(person) {
+    const btn = document.createElement('button');
+    btn.className = 'vsm-quick-btn';
+    btn.dataset.person = person;
+    updateButtonContent(btn, person);
+
+    btn.addEventListener('click', function (e) {
+      if (e.detail > 1) return;
+      e.stopPropagation();
+      activatePerson(person);
+    });
+    btn.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      detachQuickButton(person);
+    });
+    return btn;
+  }
+
+  function clearPanelButtons() {
+    if (!quickPanelEl) return;
+    const btns = quickPanelEl.querySelectorAll('.vsm-quick-btn');
+    btns.forEach(function (b) {
+      if (b.parentNode) b.parentNode.removeChild(b);
+    });
+  }
+
+  // 重建：只认当前列表里真实存在的人物
+  function rebuildQuickPanel() {
+    if (rebuildLock) return;
+    rebuildLock = true;
+    try {
+      if (!quickPanelEl) return;
+
+      const persons = getPersonNames();   // 空白帧 → []
+      orderedPersons = persons.slice();
+
+      // 收集已 detached 的按钮
+      const detachedMap = {};
+      Object.keys(quickButtons).forEach(function (p) {
+        const b = quickButtons[p];
+        if (b && b.classList.contains('vsm-quick-btn-detached')) {
+          detachedMap[p] = b;
+        }
+      });
+
+      // 彻底清理面板内旧按钮
+      clearPanelButtons();
+
+      // 清理 quickButtons 里非 detached 的引用
+      Object.keys(quickButtons).forEach(function (p) {
+        if (!detachedMap[p]) delete quickButtons[p];
+      });
+
+      // 处理已不在人物列表里的 detached 按钮：移除
+      Object.keys(detachedMap).forEach(function (p) {
+        if (persons.indexOf(p) < 0) {
+          const b = detachedMap[p];
+          if (b && b.parentNode) b.parentNode.removeChild(b);
+          delete detachedMap[p];
+          delete quickButtons[p];
+        }
+      });
+
+      // 重建面板内按钮
+      const handle = quickPanelEl.querySelector('.vsm-drag-handle');
+      persons.forEach(function (person) {
+        if (detachedMap[person]) return; // 已 detached 的不重建
+        const btn = createQuickButton(person);
+        quickButtons[person] = btn;
+        if (handle && handle.nextSibling) quickPanelEl.insertBefore(btn, handle.nextSibling);
+        else quickPanelEl.appendChild(btn);
+      });
+
+      // 恢复之前脱离的按钮位置（延迟到 DOM 插入后）
+      persons.forEach(function (person) {
+        const savedBtnPos = loadPosition(POS_KEY_QUICK_ITEM + person);
+        if (savedBtnPos && quickButtons[person]) {
+          setTimeout(function () {
+            const btn = quickButtons[person];
+            if (btn && !btn.classList.contains('vsm-quick-btn-detached')) {
+              detachQuickButton(person);
+              const w = btn.offsetWidth, h = btn.offsetHeight;
+              const nx = Math.max(0, Math.min(savedBtnPos.left, window.innerWidth - w));
+              const ny = Math.max(0, Math.min(savedBtnPos.top, window.innerHeight - h));
+              btn.style.left = nx + 'px';
+              btn.style.top = ny + 'px';
+              savePosition(POS_KEY_QUICK_ITEM + person, nx, ny);
+            }
+          }, 0);
+        }
+      });
+
+      initQuickActiveState();
+    } finally {
+      rebuildLock = false;
+    }
+  }
+
+  function createQuickPanel() {
+    if (quickPanelEl) return;
+    quickPanelEl = document.createElement('div');
+    quickPanelEl.className = 'vsm-panel vsm-quick-panel';
+    quickPanelEl.id = 'vsm-quick-panel';
+
+    const handle = document.createElement('span');
+    handle.className = 'vsm-drag-handle';
+    handle.textContent = '⋮⋮';
+    handle.title = '拖动面板';
+    quickPanelEl.appendChild(handle);
+
+    document.body.appendChild(quickPanelEl);
+
+    // ① 先绑定拖动
+    makeDraggable(quickPanelEl, {
+      saveKey: POS_KEY_QUICK,
+      dragHandleSelector: '.vsm-drag-handle'
+    });
+
+    // ② 重建按钮，让面板宽度稳定
+    rebuildQuickPanel();
+
+    // ③ 最后再应用保存的位置（此时 offsetWidth 已经包含所有按钮）
+    const savedPos = loadPosition(POS_KEY_QUICK);
+    applyPosition(quickPanelEl, savedPos, 24, 24);
+  }
+
+  /* ============================================================
+   *  八、状态助手面板
+   * ============================================================ */
+
+  let rootEl = null, moreEl = null, checkEl = null, moreOpen = false;
+
+  function getActiveTool() {
+    const moveBtn = document.querySelector('.lsf-tool[aria-label="move-tool"]');
+    const panBtn = document.querySelector('.lsf-tool[aria-label="pan"]');
+    const moveActive = !!(moveBtn && moveBtn.classList.contains('lsf-tool_active'));
+    const panActive = !!(panBtn && panBtn.classList.contains('lsf-tool_active'));
+    if (moveActive) return 'move';
+    if (panActive) return 'pan';
+    return 'none';
+  }
+
+  function updateCheckButton() {
+    if (!checkEl) return;
+    const tool = getActiveTool();
+    if (tool === 'move') {
+      if (checkEl.textContent !== '🖱️') checkEl.textContent = '🖱️';
+      checkEl.classList.remove('vsm-check-red');
+      checkEl.title = '当前：移动工具（点击查看其他标注）';
+    } else if (tool === 'pan') {
+      if (checkEl.textContent !== '🖐️') checkEl.textContent = '🖐️';
+      checkEl.classList.remove('vsm-check-red');
+      checkEl.title = '当前：拖动图像（点击查看其他标注）';
+    } else {
+      if (checkEl.textContent !== '✓') checkEl.textContent = '✓';
+      checkEl.classList.add('vsm-check-red');
+      checkEl.title = '未选择工具（点击查看其他标注）';
+    }
+  }
+
+  function chipOf(key) { return rootEl ? rootEl.querySelector('.vsm-chip[data-key="' + key + '"]') : null; }
+
+  function toggleMainDropdown(chip, cfg) {
+    if (currentAnchorEl === chip && currentDropdown) { closeDropdown(); return; }
+    const st = readGroup(cfg.title);
+    if (!st) return;
+    const items = st.inputs.map(function (inp) {
+      const raw = labelTextOf(inp);
+      return {
+        text: prettyText(raw, cfg.map),
+        isChecked: function () { return isChecked(inp); },
+        select: function () { clickOption(cfg.title, raw); }
+      };
+    });
+    showDropdown(chip, items, { multi: false });
+  }
+
+  function toggleItemDropdown(chip) {
+    if (currentAnchorEl === chip && currentDropdown) { closeDropdown(); return; }
+    const ig = findItemGroup();
+    if (!ig) return;
+    const inputs = ig.querySelectorAll('input.ant-checkbox-input');
+    const items = [];
+    for (let i = 0; i < inputs.length; i++) (function (inp) {
+      const raw = labelTextOf(inp);
+      items.push({
+        text: flipLR(raw),
+        isChecked: function () { return isChecked(inp); },
+        select: function () { try { inp.click(); } catch (e) {} }
+      });
+    })(inputs[i]);
+    showDropdown(chip, items, { multi: true });
+  }
+
+  function toggleMore() {
+    moreOpen = !moreOpen;
+    checkEl.classList.toggle('vsm-active', moreOpen);
+    moreEl.style.display = moreOpen ? 'flex' : 'none';
+    closeDropdown();
+    if (moreOpen) renderMore();
+  }
+
+  function renderMain() {
+    if (!rootEl) return;
+    updateCheckButton();
+
+    const ig = findItemGroup();
+    const iv = !!(ig && isVisible(ig));
+
+    MAIN_GROUPS.forEach(function (cfg) {
+      const chip = chipOf(cfg.key);
+      if (!chip) return;
+      const st = readGroup(cfg.title);
+      if (!st) { chip.style.display = 'none'; return; }
+      chip.style.display = '';
+      const txtEl = chip.querySelector('.vsm-chip-text');
+      let text = '—';
+      if (st.checked.length) {
+        const vals = st.checked.map(function (inp) { return prettyText(labelTextOf(inp), cfg.map); });
+        if (vals.length === 1 && vals[0] === '❌') text = cfg.short + '：❌';
+        else text = vals.join('/');
+      }
+      if (txtEl.textContent !== text) txtEl.textContent = text;
+      chip.classList.toggle('vsm-none', text === '—');
+    });
+
+    renderItemChip(ig, iv);
+  }
+
+  function renderItemChip(ig, visible) {
+    let chip = document.getElementById('vsm-item-chip');
+    if (!visible) { if (chip) chip.style.display = 'none'; return; }
+    if (!chip) {
+      chip = document.createElement('span');
+      chip.id = 'vsm-item-chip';
+      chip.className = 'vsm-chip vsm-item';
+      chip.innerHTML = '<span class="vsm-chip-text">—</span>';
+      chip.addEventListener('click', function (e) { e.stopPropagation(); toggleItemDropdown(chip); });
+      rootEl.insertBefore(chip, checkEl);
+    }
+    chip.style.display = '';
+    const inputs = ig.querySelectorAll('input.ant-checkbox-input');
+    const checked = [];
+    for (let i = 0; i < inputs.length; i++) if (isChecked(inputs[i])) checked.push(labelTextOf(inputs[i]));
+    const txtEl = chip.querySelector('.vsm-chip-text');
+    let text = '—';
+    if (checked.length) text = checked.map(flipLR).join('/');
+    if (txtEl.textContent !== text) txtEl.textContent = text;
+    chip.classList.toggle('vsm-none', text === '—');
+  }
+
+  function renderMore() {
+    if (!moreEl) return;
+    moreEl.innerHTML = '';
+
+    let visibleCount = 0;
+    OTHER_GROUPS.forEach(function (cfg) {
+      const st = readGroup(cfg.title);
+      if (!st) return;
+      visibleCount++;
+
+      const tag = document.createElement('div');
+      tag.className = 'vsm-tag';
+      tag.setAttribute('data-title', cfg.title);
+      tag.title = cfg.title + '（点击切换）';
+
+      let text = '—';
+      if (st.checked.length) {
+        const vals = st.checked.map(function (inp) { return flipLR(labelTextOf(inp)); });
+        if (vals.length === 1) {
+          if (isNoneLike(vals[0])) text = cfg.short + '：无';
+          else if (isXLike(vals[0])) text = cfg.short + '：❌';
+          else text = vals[0];
+        } else text = vals.join('/');
+      } else tag.classList.add('vsm-none');
+      tag.textContent = text;
+
+      moreEl.appendChild(tag);
+    });
+
+    if (visibleCount === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'vsm-tag vsm-none';
+      empty.textContent = '未识别到可用分组';
+      moreEl.appendChild(empty);
+    }
+
+    const btn = document.createElement('div');
+    btn.className = 'vsm-tag vsm-action';
+    btn.textContent = '后续帧';
+    btn.title = '把当前对象已填的属性批量覆盖到它在其它帧的标注上';
+    moreEl.appendChild(btn);
+  }
+
+  function renderAll() {
+    renderMain();
+    if (moreOpen) renderMore();
+    initQuickActiveState();
+  }
+
+  function createMainPanel() {
+    if (rootEl) return;
+    rootEl = document.createElement('div');
+    rootEl.className = 'vsm-panel vsm-main-panel';
+    rootEl.id = 'vsm-main-panel';
+
+    const handle = document.createElement('span');
+    handle.className = 'vsm-drag-handle';
+    handle.textContent = '⋮⋮';
+    handle.title = '拖动面板';
+    rootEl.appendChild(handle);
+
+    MAIN_GROUPS.forEach(function (cfg) {
+      const chip = document.createElement('span');
+      chip.className = 'vsm-chip vsm-none';
+      chip.dataset.key = cfg.key;
+      chip.innerHTML = '<span class="vsm-chip-text">—</span>';
+      chip.addEventListener('click', function (e) {
+        e.stopPropagation();
+        toggleMainDropdown(chip, cfg);
+      });
+      rootEl.appendChild(chip);
+    });
+
+    checkEl = document.createElement('span');
+    checkEl.className = 'vsm-check';
+    checkEl.textContent = '✓';
+    checkEl.title = '查看其他标注';
+    checkEl.addEventListener('click', function (e) {
+      e.stopPropagation();
+      toggleMore();
+    });
+    rootEl.appendChild(checkEl);
+
+    moreEl = document.createElement('div');
+    moreEl.className = 'vsm-more';
+    moreEl.style.display = 'none';
+    moreEl.addEventListener('scroll', closeDropdown);
+
+    moreEl.addEventListener('mousedown', function (e) {
+      const tag = e.target.closest ? e.target.closest('.vsm-tag') : null;
+      if (!tag) return;
+      e.stopPropagation();
+      e.preventDefault();
+
+      if (tag.classList.contains('vsm-action')) {
+        if (currentAnchorEl === tag && currentDropdown) { closeDropdown(); return; }
+        const ok = triggerOverrideNextFrames();
+        if (!ok) {
+          tag.textContent = '未找到按钮';
+          tag.classList.add('vsm-done');
+          setTimeout(function () { tag.textContent = '后续帧'; tag.classList.remove('vsm-done'); }, 1200);
+          return;
+        }
+        tag.textContent = '已覆盖 ✓';
+        tag.classList.add('vsm-done');
+        setTimeout(function () { tag.textContent = '后续帧'; tag.classList.remove('vsm-done'); }, 1200);
+        return;
+      }
+
+      const title = tag.getAttribute('data-title');
+      if (!title) return;
+      if (currentAnchorEl === tag && currentDropdown) { closeDropdown(); return; }
+      const cur = readGroup(title);
+      if (!cur) return;
+      const items = cur.inputs.map(function (inp) {
+        const raw = labelTextOf(inp);
+        return {
+          text: flipLR(raw),
+          isChecked: function () { return isChecked(inp); },
+          select: function () { clickOption(title, raw); }
+        };
+      });
+      showDropdown(tag, items, { multi: false });
+    });
+
+    rootEl.appendChild(moreEl);
+    document.body.appendChild(rootEl);
+
+    const savedPos = loadPosition(POS_KEY_MAIN);
+    applyPosition(rootEl, savedPos, 24, 24);
+
+    makeDraggable(rootEl, {
+      saveKey: POS_KEY_MAIN,
+      dragHandleSelector: '.vsm-drag-handle'
+    });
+
+    updateCheckButton();
+  }
+
+  /* ============================================================
+   *  九、数字快捷键（快捷键 = 人物编号）
+   * ============================================================ */
+
+  function isEditableTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (el.isContentEditable) return true;
+    if (el.closest && el.closest('[contenteditable="true"]')) return true;
+    return false;
+  }
+
+  function handleHotkey(e) {
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    if (isEditableTarget(e.target)) return;
+    if (e.key < '1' || e.key > String(MAX_HOTKEY)) return;
+    const num = parseInt(e.key, 10);
+    if (isNaN(num)) return;
+
+    let targetPerson = null;
+    for (let i = 0; i < orderedPersons.length; i++) {
+      if (getPersonNumber(orderedPersons[i]) === num) {
+        targetPerson = orderedPersons[i];
+        break;
+      }
+    }
+    if (!targetPerson) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    activatePerson(targetPerson);
+  }
+
+  document.addEventListener('keydown', handleHotkey, true);
+
+  /* ============================================================
+   *  十、监听 & 启动
+   * ============================================================ */
+
+  function startObserver() {
+    let rafId = null;
+    const mo = new MutationObserver(function () {
+      if (rafId) return;
+      rafId = requestAnimationFrame(function () {
+        rafId = null;
+        renderAll();
+        rebuildQuickPanel();
+      });
+    });
+    mo.observe(document.body, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ['aria-pressed', 'class', 'checked', 'title']
+    });
+    setInterval(function () {
+      renderAll();
+      rebuildQuickPanel();
+    }, 800);
+  }
+
+  function boot() {
+    injectStyle();
+    createQuickPanel();
+    createMainPanel();
+    renderAll();
+    startObserver();
+
+    setTimeout(initQuickActiveState, 200);
+    setTimeout(initQuickActiveState, 800);
+
+    window.addEventListener('resize', function () {
+      closeDropdown();
+      [quickPanelEl, rootEl].forEach(function (el) {
+        if (!el) return;
+        if (!el.style.left || el.style.left === 'auto') return;
+        const w = el.offsetWidth, h = el.offsetHeight;
+        const nx = Math.max(0, Math.min(parseFloat(el.style.left) || 0, window.innerWidth - w));
+        const ny = Math.max(0, Math.min(parseFloat(el.style.top) || 0, window.innerHeight - h));
+        el.style.left = nx + 'px';
+        el.style.top = ny + 'px';
+      });
+    });
+  }
+
+  if (document.body) boot();
+  else document.addEventListener('DOMContentLoaded', boot);
+})();
